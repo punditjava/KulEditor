@@ -6,6 +6,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -20,9 +21,11 @@
 #define CTRL_KEY(k) ((k) & 0x1f)
 #define KUL_VERSION "0.3.0"
 #define TAB_STOP 8
+#define QUIT_TIMES 3
 #define ABUF_INIT {NULL, 0}
 
 enum editor_key{
+	BACKSPACE = 127,
 	ARROW_LEFT = 1000,
 	ARROW_RIGHT,
 	ARROW_UP, 
@@ -53,6 +56,7 @@ struct config
 	int screencols;
 	int num_row;
 	erow *row;
+	int dirty;/*проверяем изменён ли файл)*/
 	char *file_name;
 	char status_message[80];
 	time_t status_time;
@@ -60,6 +64,12 @@ struct config
 };
 
 struct config CONFIG; /*Глобальная структура(состояяние редактора)*/
+
+	/***PROTOTYPES***/
+
+void set_status_message(const char *fmt, ...);
+void refresh_screen();
+char *input_prompt(char *prompt);
 
 	/*** TERMINAL ***/
 
@@ -223,11 +233,13 @@ void update_row(erow *row)
 }
 
 
-void append_row(char *s, size_t len)
+void insert_row(int at, char *s, size_t len)
 {	
-	CONFIG.row = realloc(CONFIG.row, sizeof(erow) * (CONFIG.num_row + 1));
+	if(at < 0 || at > CONFIG.num_row) return;
 
-	int at = CONFIG.num_row;
+	CONFIG.row = realloc(CONFIG.row, sizeof(erow) * (CONFIG.num_row + 1));
+	memmove(&CONFIG.row[at + 1], &CONFIG.row[at], sizeof(erow) * (CONFIG.num_row - at));
+
 	CONFIG.row[at].size = len;
 	CONFIG.row[at].chars = malloc(len + 1);
 	memcpy(CONFIG.row[at].chars, s, len);
@@ -238,10 +250,117 @@ void append_row(char *s, size_t len)
 	update_row(&CONFIG.row[at]);
 
 	CONFIG.num_row++;
-	
+	CONFIG.dirty++;
+}
+
+void free_row(erow *row) /*Чистим память строки*/
+{
+	free(row -> render);
+	free(row -> chars);
+}
+
+void delete_row(int at)
+{
+	if(at < 0 || at >= CONFIG.num_row) return;
+	free_row(&CONFIG.row[at]);
+	memmove(&CONFIG.row[at], &CONFIG.row[at + 1], sizeof(erow) * (CONFIG.num_row - at - 1));/*перезаписал удаленную структуру строк с остальными строками, которые идут после нее, и уменьшил num_row. */
+	CONFIG.num_row--;
+	CONFIG.dirty++;
+}
+
+void row_insert_char(erow *row, int at, int c)
+{
+	if(at < 0 || at > row->size) at = row->size; /*указываем конец строки*/
+	row->chars = realloc(row->chars, row->size + 2);
+	memmove(&row->chars[at + 1], &row->chars[at], row -> size - at + 1);/*освобождаем место для ещё одного символа*/
+	row->size++;
+	row->chars[at] = c;/*добавили символ в массив*/
+	update_row(row);/*обновили*/
+	CONFIG.dirty++;
+}
+
+void row_append_string(erow *row, char *s, size_t len)
+{
+	row->chars = realloc(row->chars, row->size + len + 1);
+	memcpy(&row->chars[row->size], s, len);
+	row->size += len;
+	row->chars[row->size] = '\0';
+	update_row(row);
+	CONFIG.dirty++;
+}
+
+void delete_char(erow *row, int at)
+{
+	if(at < 0 || at >= row->size) return;
+	memmove(&row -> chars[at], &row-> chars[at + 1], row->size - at);
+	row->size--;
+	update_row(row);
+	CONFIG.dirty++;
+}
+
+
+	/*** EDITOR ORERATIONS ***/
+
+void editor_insert_char(int c){
+	if (CONFIG.cy == CONFIG.num_row) {/*Если это последняя строка, добавть ещё одну */
+		insert_row(CONFIG.num_row, "", 0);
+	}
+	row_insert_char(&CONFIG.row[CONFIG.cy], CONFIG.cx, c);
+}
+
+void editor_insert_new_line()
+{
+	if(CONFIG.cx == 0){
+		insert_row(CONFIG.cy, "", 0);/*просто добавил новую строку*/
+	} else {
+		erow *row = &CONFIG.row[CONFIG.cy];
+		insert_row(CONFIG.cy + 1, &row -> chars[CONFIG.cx], row->size - CONFIG.cx);/*Разбиваем на 2 строки и работает*/
+		row = &CONFIG.row[CONFIG.cy];
+		row->size = CONFIG.cx;
+		row->chars[row->size] = '\0';
+		update_row(row);
+	}
+	CONFIG.cy++;
+	CONFIG.cx = 0;
+}
+
+void editor_delete_char()
+{
+	if(CONFIG.cy == CONFIG.num_row) return;
+	if(CONFIG.cx == 0 && CONFIG.cy == 0) return;
+
+	erow *row = &CONFIG.row[CONFIG.cy];
+	if(CONFIG.cx > 0){
+		delete_char(row, CONFIG.cx - 1);
+		CONFIG.cx--;
+	} else{
+		CONFIG.cx = CONFIG.row[CONFIG.cy - 1].size;
+		row_append_string(&CONFIG.row[CONFIG.cy - 1], row->chars, row->size);
+		delete_row(CONFIG.cy);
+		CONFIG.cy--;
+	}
 }
 
 	/***FILE I/O***/
+
+char *editor_rows_to_string(int *buf_length)
+{
+	int total_length = 0;
+	int j;
+	for (j = 0; j < CONFIG.num_row; ++j)
+		total_length += CONFIG.row[j].size + 1;
+	*buf_length = total_length;
+
+	char *buf = malloc(total_length);
+	char *p = buf;
+	for (j = 0; j < CONFIG.num_row; ++j){
+		memcpy(p, CONFIG.row[j].chars, CONFIG.row[j].size);
+		p += CONFIG.row[j].size;
+		*p = '\n';
+		p++;
+	}
+	return buf;
+}
 
 void editor_open(char *file_name)
 {
@@ -258,10 +377,42 @@ void editor_open(char *file_name)
 		while (line_length > 0 && (line[line_length - 1] == '\n' ||
 									line[line_length - 1] == '\r'))
 			line_length--;
-		append_row(line, line_length);
+		insert_row(CONFIG.num_row, line, line_length);
 	}
 	free(line);
 	free(fp);
+	CONFIG.dirty = 0;
+}
+
+void editor_save()
+{
+	if(CONFIG.file_name == NULL){
+		CONFIG.file_name = input_prompt("Save as: %s (ESC to cancel)");
+		if(CONFIG.file_name == NULL){
+			set_status_message("Save aborted");
+			return;
+		}
+	}
+
+	int len;
+	char *buf = editor_rows_to_string(&len);
+
+	int fd = open(CONFIG.file_name, O_RDWR | O_CREAT, 0644);
+	if(fd != -1){
+		if (ftruncate(fd, len) != -1){
+			if (write(fd, buf, len) == len){
+				close(fd);
+				free(buf);
+				CONFIG.dirty = 0;
+				set_status_message("%d bytes written to disk", len);
+				return;
+			}
+		}
+		close(fd);
+	}
+
+	free(buf);
+	set_status_message("Can't save! I/O error: %s", strerror(errno));
 }
 
 	/***APPEND BUFFER***/
@@ -343,9 +494,7 @@ void draw_rows(struct append_buffer *ab)
 		
 		ab_append(ab, "\x1b[K", 3);
 		
-		ab_append(ab, "\r\n", 2);
-	
-		
+		ab_append(ab, "\r\n", 2);		
 	}
 }
 
@@ -354,7 +503,8 @@ void draw_status_bar(struct append_buffer *ab)
 	ab_append(ab, "\x1b[7m", 4);
 	char status[80], rstatus[80];
 	int len = snprintf(status, sizeof(status), "%.20s - %d lines", 
-		CONFIG.file_name ? CONFIG.file_name : "[No Name]", CONFIG.num_row);
+		CONFIG.file_name ? CONFIG.file_name : "[No Name]", CONFIG.num_row,
+		CONFIG.dirty ? "(modified)" : "");
 	int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", CONFIG.cy + 1, CONFIG.num_row);
 	if(len > CONFIG.screencols) len = CONFIG.screencols;
 	ab_append(ab, status, len);
@@ -413,6 +563,42 @@ void set_status_message(const char *fmt, ...){
 }
 
 	/*** INPUT ***/
+
+char *input_prompt(char *prompt)
+{
+	size_t buf_size = 128; /*таким образом принимаем только char*/
+	char *buf = malloc(buf_size);
+
+	size_t buf_length = 0;
+	buf[0] = '\0';
+
+	while(1){
+		set_status_message(prompt, buf);
+		refresh_screen(); /*ждём ввода строки*/
+
+		int c = read_key();
+		if(c == DELETE_KEY || c == CTRL_KEY('h') || c == BACKSPACE){
+			if(buf_length != 0) buf[--buf_length] = '\0';
+		} else if (c == '\x1b') {
+			set_status_message("");
+			free(buf);
+			return NULL;
+		} else if(c == '\r'){
+			if(buf_length != 0){
+				set_status_message("");
+				return buf;
+			}
+		} else if(!iscntrl(c) && c < 128){
+			if(buf_length == buf_size - 1){
+				buf_size *= 2;
+				buf = realloc(buf, buf_size);
+			}
+			buf[buf_length++] = c;
+			buf[buf_length] = '\0';
+		}
+	}
+}
+
 void move_cursor(int key)
 {
 	erow *row = (CONFIG.cy >= CONFIG.num_row) ? NULL : &CONFIG.row[CONFIG.cy];
@@ -453,26 +639,49 @@ void move_cursor(int key)
 	if(CONFIG.cx > row_len){
 		CONFIG.cx = row_len;
 	}
-
 }
 
 void keypress()
 {
+	static int quit_times = QUIT_TIMES;
+
 	int c = read_key();
 
 	switch(c){
+		case '\r':
+		editor_insert_new_line();
+		break;
+
 		case CTRL_KEY('q'):
+		if (CONFIG.dirty && quit_times > 0){
+			set_status_message("WARNING!!! File has unsaved changes. "
+          	"Press Ctrl-Q %d more times to quit.", quit_times);
+			quit_times--;
+			return;
+		}
 		write(STDOUT_FILENO, "\x1b[2J", 4);
 		write(STDOUT_FILENO, "\x1b[H", 3);
 		exit(0);
 		break;
 
+		case CTRL_KEY('s'):
+		editor_save();
+		break;
+
 		case HOME_KEY:
 		CONFIG.cx = 0;
 		break;
+
 		case END_KEY:
 		if(CONFIG.cy < CONFIG.num_row)
 			CONFIG.cx = CONFIG.row[CONFIG.cy].size;
+		break;
+
+		case BACKSPACE:
+		case CTRL_KEY('h'):
+		case DELETE_KEY:
+		if(c == DELETE_KEY) move_cursor(ARROW_RIGHT);
+		editor_delete_char();
 		break;
 
 		case PAGE_UP:
@@ -493,7 +702,17 @@ void keypress()
 		case ARROW_RIGHT:
 			move_cursor(c);
 			break;
+
+		case CTRL_KEY('l'):
+		case '\x1b':	
+		break;
+
+		default:
+		editor_insert_char(c);
+		break;	
 	}
+
+	quit_times = QUIT_TIMES;
 }
 
 	/*** INIT ***/
@@ -507,6 +726,7 @@ void init()
 	CONFIG.scroll_hor = 0;
 	CONFIG.num_row = 0;
 	CONFIG.row = NULL;
+	CONFIG.dirty = 0;
 	CONFIG.file_name = NULL;
 	CONFIG.status_message[0] = '\0';
 	CONFIG.status_time = 0;
@@ -524,7 +744,7 @@ int main(int argc, char *argv[])
 		editor_open(argv[1]);
 	}
 
-	set_status_message("HELP: Ctrl-Q = quit");
+	set_status_message("HELP: Ctrl-S = save | Ctrl-Q = quit");
 
 	while (1){
 		refresh_screen();
