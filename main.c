@@ -19,7 +19,7 @@
 
 	/***DEFINES***/
 #define CTRL_KEY(k) ((k) & 0x1f)
-#define KUL_VERSION "0.3.0"
+#define KUL_VERSION "1.0.0"
 #define TAB_STOP 8
 #define QUIT_TIMES 3
 #define ABUF_INIT {NULL, 0}
@@ -50,8 +50,8 @@ struct config
 {
 	int cx, cy; /*Координаты курсора*/
 	int rx;
-	int scroll_ver;
-	int scroll_hor;
+	int scroll_ver;/*(row)*/
+	int scroll_hor;/*(col)*/
 	int screenrows;
 	int screencols;
 	int num_row;
@@ -69,7 +69,7 @@ struct config CONFIG; /*Глобальная структура(состояян
 
 void set_status_message(const char *fmt, ...);
 void refresh_screen();
-char *input_prompt(char *prompt);
+char *input_prompt(char *prompt, void (*callback)(char *, int));
 
 	/*** TERMINAL ***/
 
@@ -209,6 +209,21 @@ int row_cx_to_rx(erow *row, int cx)
 	return rx;
 }		
 
+int row_rx_to_cx(erow *row, int rx)
+{
+	int cur_rx = 0;
+	int cx;
+	for (cx = 0; cx < row->size; ++cx)
+	{
+		if (row->chars[cx] == '\t'){
+			cur_rx += (TAB_STOP - 1) - (cur_rx % TAB_STOP);
+		}
+		cur_rx++;
+		if(cur_rx > rx) return cx;
+	}
+	return cx;
+}
+
 void update_row(erow *row)
 {
 	int tabs = 0;
@@ -341,6 +356,65 @@ void editor_delete_char()
 	}
 }
 
+	/***FIND***/
+
+void find_callback(char *query, int key)
+{
+	static int last_match = -1;
+	static int direction = 1;
+
+	if(key == '\r' || key == '\x1b'){
+		last_match = -1;
+		direction = 1;
+		return;
+	} else if (key == ARROW_RIGHT || key == ARROW_DOWN){
+		direction = 1;
+	} else if (key == ARROW_LEFT || key == ARROW_UP){
+		direction = -1;
+	} else{
+		last_match = -1;
+		direction = 1;
+	}
+
+	if(last_match == -1) direction = 1;
+	int current = last_match;
+	int i;
+	for (i = 0; i < CONFIG.num_row; ++i)
+	{	
+		current += direction;
+		if(current == -1) current = CONFIG.num_row - 1;
+		else if(current == CONFIG.num_row) current = 0;
+
+		erow *row = &CONFIG.row[i];
+		char *match = strstr(row -> render, query);
+		if(match){
+			last_match = current;
+			CONFIG.cy = current;
+			CONFIG.cx = row_rx_to_cx(row, match - row->render);
+			CONFIG.scroll_ver = CONFIG.num_row;
+			break;
+		}
+	}
+}
+
+void find()
+{
+	int saved_cx = CONFIG.cx;
+	int saved_cy = CONFIG.cy;
+	int saved_scroll_ver = CONFIG.scroll_ver;
+	int saved_scroll_hor = CONFIG.scroll_hor;
+ 
+	char *query = input_prompt("Search: %s (ESC/Arrows/Enter)", find_callback);
+	if (query) {
+	free(query);
+	} else {
+		CONFIG.cx = saved_cx;
+		CONFIG.cy = saved_cy;
+		CONFIG.scroll_ver = saved_scroll_ver;
+		CONFIG.scroll_hor = saved_scroll_hor;
+	}
+}
+
 	/***FILE I/O***/
 
 char *editor_rows_to_string(int *buf_length)
@@ -387,7 +461,7 @@ void editor_open(char *file_name)
 void editor_save()
 {
 	if(CONFIG.file_name == NULL){
-		CONFIG.file_name = input_prompt("Save as: %s (ESC to cancel)");
+		CONFIG.file_name = input_prompt("Save as: %s (ESC to cancel)", NULL);
 		if(CONFIG.file_name == NULL){
 			set_status_message("Save aborted");
 			return;
@@ -564,7 +638,7 @@ void set_status_message(const char *fmt, ...){
 
 	/*** INPUT ***/
 
-char *input_prompt(char *prompt)
+char *input_prompt(char *prompt, void (*callback)(char *, int))
 {
 	size_t buf_size = 128; /*таким образом принимаем только char*/
 	char *buf = malloc(buf_size);
@@ -581,11 +655,13 @@ char *input_prompt(char *prompt)
 			if(buf_length != 0) buf[--buf_length] = '\0';
 		} else if (c == '\x1b') {
 			set_status_message("");
+			if(callback) callback(buf, c);
 			free(buf);
 			return NULL;
 		} else if(c == '\r'){
 			if(buf_length != 0){
 				set_status_message("");
+				if(callback) callback(buf, c);
 				return buf;
 			}
 		} else if(!iscntrl(c) && c < 128){
@@ -596,6 +672,8 @@ char *input_prompt(char *prompt)
 			buf[buf_length++] = c;
 			buf[buf_length] = '\0';
 		}
+
+		if(callback) callback(buf, c);
 	}
 }
 
@@ -677,6 +755,10 @@ void keypress()
 			CONFIG.cx = CONFIG.row[CONFIG.cy].size;
 		break;
 
+		case CTRL_KEY('f'):
+		find();
+		break;
+
 		case BACKSPACE:
 		case CTRL_KEY('h'):
 		case DELETE_KEY:
@@ -744,7 +826,7 @@ int main(int argc, char *argv[])
 		editor_open(argv[1]);
 	}
 
-	set_status_message("HELP: Ctrl-S = save | Ctrl-Q = quit");
+	set_status_message("HELP: Ctrl-S = save | Ctrl-F = find | Ctrl-Q = quit");
 
 	while (1){
 		refresh_screen();
