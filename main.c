@@ -19,10 +19,12 @@
 
 	/***DEFINES***/
 #define CTRL_KEY(k) ((k) & 0x1f)
-#define KUL_VERSION "1.0.0"
+#define KUL_VERSION "1.3.0"
 #define TAB_STOP 8
 #define QUIT_TIMES 3
 #define ABUF_INIT {NULL, 0}
+#define HL_HIGHLIGHT_NUMBERS (1<<0)
+#define HL_HIGHLIGHT_STRINGS (1<<1)
 
 enum editor_key{
 	BACKSPACE = 127,
@@ -37,13 +39,37 @@ enum editor_key{
 	PAGE_DOWN 
 };
 
+enum editor_highlight{
+	HL_NORMAL = 0,
+	HL_COMMENT,
+	HL_MLCOMMENT,
+	HL_KEYWORD1,
+	HL_KEYWORD2,
+	HL_STRING,
+	HL_NUMBER,
+	HL_MATCH
+};
+
 	/*** DATA ***/
 
+struct syntax {
+	char *filetype;
+	char **filematch;
+	char **keywords;
+	char *singleline_comment_start;
+	char *multiline_comment_start;
+	char *multiline_comment_end;
+	int flags;
+};
+
 typedef struct erow{
+	int idx;
 	int size;
 	int rsize;/*размер для вкладок*/
 	char *chars;
 	char *render;
+	unsigned char *hl;/*для выделения цвета*/
+	int hl_open_comment;
 } erow;
 
 struct config
@@ -60,10 +86,33 @@ struct config
 	char *file_name;
 	char status_message[80];
 	time_t status_time;
+	struct syntax *syntax;
 	struct termios global_term; /*Original terminal*/	
 };
 
 struct config CONFIG; /*Глобальная структура(состояяние редактора)*/
+
+	/***FILETYPES***/
+
+char *C_HL_extensions[] = { ".c", ".h", ".cpp", NULL};
+char *C_HL_keywords[] = {
+	"switch", "if", "while", "for", "break", "continue", "return", "else",
+  	"struct", "union", "typedef", "static", "enum", "class", "case",
+  	"int|", "long|", "double|", "float|", "char|", "unsigned|", "signed|",
+  	"void|", NULL
+};
+
+struct syntax HLDB[] = {
+	{
+		"c",
+		C_HL_extensions,
+		C_HL_keywords,
+		"//", "/*", "*/",
+		HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS
+	},
+};
+#define HLDB_ENTRIES (sizeof(HLDB) / sizeof(HLDB[0]))
+
 
 	/***PROTOTYPES***/
 
@@ -160,7 +209,7 @@ int read_key()
 
 int cursor_position(int *rows, int *cols)
 {
-	char buf[64];
+	char buf[32];
 	unsigned int i = 0;
 
 	if(write(STDOUT_FILENO, "\x1b[6n", 4) != 4)
@@ -194,7 +243,169 @@ int get_window_size(int *rows, int *cols)
 		return 0;
 	}
 }
+
+	/***SYNTAX HIGHLIGHTING***/
+
+int is_separator(int c)
+{
+	return isspace(c) || c == '\0' || strchr(",.()+-/*=~%<>[];", c) != NULL;
+}
+
+void update_syntax(erow *row)
+{
+	row->hl = realloc(row->hl, row->rsize);
+	memset(row->hl, HL_NORMAL, row->rsize);
+
+	if(CONFIG.syntax == NULL) return;
+
+	char **keywords = CONFIG.syntax->keywords;
+
+	char *scs = CONFIG.syntax->singleline_comment_start;
+	char *mcs = CONFIG.syntax->multiline_comment_start;
+	char *mce = CONFIG.syntax->multiline_comment_end;
+
+	int scs_len = scs ? strlen(scs) : 0;
+	int mcs_len = mcs ? strlen(mcs) : 0;
+	int mce_len = mce ? strlen(mce) : 0;
+
+	int prev_sep = 1;
+	int in_string = 0;
+	int in_comment = (row->idx > 0 && CONFIG.row[row->idx - 1].hl_open_comment);
+
+	int i = 0;
+	while (i < row->rsize) {
+		char c = row->render[i];
+		unsigned char prev_hl = (i > 0) ? row->hl[i - 1] : HL_NORMAL;
+
+		if (scs_len && !in_string && !in_comment){
+			if (!strncmp(&row->render[i], scs, scs_len)) {
+				memset(&row->hl[i], HL_COMMENT, row->rsize - i);
+				break;
+			}
+		}
+
+		if(mcs_len && mce_len && !in_string) {
+			if (in_comment) {
+				row->hl[i] = HL_MLCOMMENT;
+				if (!strncmp(&row->render[i], mce, mce_len)) {
+					memset(&row->hl[i], HL_MLCOMMENT, mce_len);
+					i += mce_len;
+					in_comment = 0;
+					prev_sep = 1;
+					continue;
+				} else {
+					i++;
+					continue;
+				}
+			} else if (!strncmp(&row->render[i], mcs, mcs_len)) {
+				memset(&row->hl[i], HL_MLCOMMENT, mcs_len);
+				i += mcs_len;
+				in_comment = 1;
+				continue;
+			}
+		}
+
+		if(CONFIG.syntax->flags & HL_HIGHLIGHT_STRINGS) {
+			if(in_string) {
+				row->hl[i] = HL_STRING;
+				if (c == '\\' && i + 1 < row->rsize) {
+					row->hl[i + 1] = HL_STRING;
+					i += 2;
+					continue;
+				}
+				if (c == in_string) in_string = 0;
+				i++;
+				prev_sep = 1;
+				continue;
+			} else {
+				if (c == '"' || c == '\''){
+					in_string = c;
+					row->hl[i] = HL_STRING;
+					i++;
+					continue;
+				}
+			}
+		}
+
+		if(CONFIG.syntax->flags & HL_HIGHLIGHT_NUMBERS){
+			if ((isdigit(c) && (prev_sep || prev_hl == HL_NUMBER))
+			|| (c == '.' && prev_hl == HL_NUMBER)) {
+				row->hl[i] = HL_NUMBER;
+				i++;
+				prev_sep = 0;
+				continue;
+			}
+		}
+
+		if (prev_sep) {
+			int j;
+			for (j = 0; keywords[j]; ++j) {
+				int klen = strlen(keywords[j]);
+				int kw2 = keywords[j][klen - 1] == '|';
+				if(kw2) klen--;
+
+				if (!strncmp(&row->render[i], keywords[j], klen)
+					&& is_separator(row->render[i + klen])) {
+					memset(&row->hl[i], kw2 ? HL_KEYWORD2 : HL_KEYWORD1, klen);
+					i += klen;
+				}
+			}
+		}	
+		prev_sep = is_separator(c);
+		i++;
+	}
+	int changes = (row->hl_open_comment != in_comment);
+	row->hl_open_comment = in_comment;
+	if (changes && row->idx + 1 < CONFIG.num_row) {
+		update_syntax(&CONFIG.row[row->idx + 1]);
+	}
+}
+
+int syntax_to_color(int hl)
+{
+	switch(hl) { 
+		case HL_COMMENT:
+		case HL_MLCOMMENT: return 36; /*ANSI код для бирюзовый*/
+		case HL_KEYWORD1: return 33;/*ANSI код жёлтого*/
+		case HL_KEYWORD2: return 32;/*ANSI код для зелёного*/
+		case HL_STRING: return 35; /*ANSI код для пурпурный*/
+		case HL_NUMBER: return 31; /*ANSI код для красного*/
+		case HL_MATCH: return 34; /*ANSI код для голубого*/
+		default: return 37; /*ANSI код для белого*/
+	}
+}
+
+void select_syntax_highlighting()
+{
+	CONFIG.syntax = NULL;
+	if(CONFIG.file_name == NULL) return;
+
+	char *ext = strrchr(CONFIG.file_name, '.');
+	unsigned int j = 0;
+
+	for (j; j < HLDB_ENTRIES; ++j){
+		struct syntax *s = &HLDB[j];
+		unsigned int i = 0;
+		while (s->filematch[i]){
+			int is_ext = (s->filematch[i][0] == '.');
+			if ((is_ext && ext && !strcmp(ext, s->filematch[i])) ||
+				(!is_ext && strstr(CONFIG.file_name, s->filematch[i]))) {
+				CONFIG.syntax = s;
+
+			int file_row;
+			for (file_row = 0; file_row < CONFIG.num_row; ++file_row){
+				update_syntax(&CONFIG.row[file_row]);
+			}
+
+				return;
+			}
+			i++;
+		}
+	}
+}
+
 	/***ROW OPERATIONS***/
+
 	
 int row_cx_to_rx(erow *row, int cx)
 {
@@ -245,6 +456,8 @@ void update_row(erow *row)
 	}
 	row->render[dx] = '\0';
 	row->rsize = dx;
+
+	update_syntax(row);
 }
 
 
@@ -254,6 +467,12 @@ void insert_row(int at, char *s, size_t len)
 
 	CONFIG.row = realloc(CONFIG.row, sizeof(erow) * (CONFIG.num_row + 1));
 	memmove(&CONFIG.row[at + 1], &CONFIG.row[at], sizeof(erow) * (CONFIG.num_row - at));
+	int i;
+	for (i = at + 1; i <= CONFIG.num_row; ++i){
+		CONFIG.row[i].idx++;
+	}
+
+	CONFIG.row[at].idx = at;
 
 	CONFIG.row[at].size = len;
 	CONFIG.row[at].chars = malloc(len + 1);
@@ -262,6 +481,8 @@ void insert_row(int at, char *s, size_t len)
 
 	CONFIG.row[at].rsize = 0;
 	CONFIG.row[at].render = NULL;
+	CONFIG.row[at].hl = NULL;
+	CONFIG.row[at].hl_open_comment = 0;
 	update_row(&CONFIG.row[at]);
 
 	CONFIG.num_row++;
@@ -272,6 +493,7 @@ void free_row(erow *row) /*Чистим память строки*/
 {
 	free(row -> render);
 	free(row -> chars);
+	free(row->hl);
 }
 
 void delete_row(int at)
@@ -279,6 +501,8 @@ void delete_row(int at)
 	if(at < 0 || at >= CONFIG.num_row) return;
 	free_row(&CONFIG.row[at]);
 	memmove(&CONFIG.row[at], &CONFIG.row[at + 1], sizeof(erow) * (CONFIG.num_row - at - 1));/*перезаписал удаленную структуру строк с остальными строками, которые идут после нее, и уменьшил num_row. */
+	int i;
+	for (i = at; i < CONFIG.num_row - 1; i++) CONFIG.row[i].idx--;
 	CONFIG.num_row--;
 	CONFIG.dirty++;
 }
@@ -321,6 +545,7 @@ void editor_insert_char(int c){
 		insert_row(CONFIG.num_row, "", 0);
 	}
 	row_insert_char(&CONFIG.row[CONFIG.cy], CONFIG.cx, c);
+	CONFIG.cx++;
 }
 
 void editor_insert_new_line()
@@ -363,6 +588,15 @@ void find_callback(char *query, int key)
 	static int last_match = -1;
 	static int direction = 1;
 
+	static int save_hl_line;
+	static char *save_hl = NULL;
+
+	if(save_hl) {
+		memcpy(CONFIG.row[save_hl_line].hl, save_hl, CONFIG.row[save_hl_line].rsize);
+		free(save_hl);
+		save_hl = NULL;
+	}
+
 	if(key == '\r' || key == '\x1b'){
 		last_match = -1;
 		direction = 1;
@@ -385,13 +619,18 @@ void find_callback(char *query, int key)
 		if(current == -1) current = CONFIG.num_row - 1;
 		else if(current == CONFIG.num_row) current = 0;
 
-		erow *row = &CONFIG.row[i];
+		erow *row = &CONFIG.row[current];
 		char *match = strstr(row -> render, query);
 		if(match){
 			last_match = current;
 			CONFIG.cy = current;
 			CONFIG.cx = row_rx_to_cx(row, match - row->render);
 			CONFIG.scroll_ver = CONFIG.num_row;
+
+			save_hl_line = current;
+			save_hl = malloc(row->rsize);
+			memcpy(save_hl, row->hl, row->rsize);
+			memset(&row->hl[match - row->render], HL_MATCH, strlen(query));
 			break;
 		}
 	}
@@ -405,6 +644,7 @@ void find()
 	int saved_scroll_hor = CONFIG.scroll_hor;
  
 	char *query = input_prompt("Search: %s (ESC/Arrows/Enter)", find_callback);
+	
 	if (query) {
 	free(query);
 	} else {
@@ -441,6 +681,8 @@ void editor_open(char *file_name)
 	free(CONFIG.file_name);
 	CONFIG.file_name = strdup(file_name);/*делает копию этой строки*/
 
+	select_syntax_highlighting();
+
 	FILE *fp = fopen(file_name, "r");
 	if(!fp) die("fopen");
 
@@ -466,6 +708,7 @@ void editor_save()
 			set_status_message("Save aborted");
 			return;
 		}
+		select_syntax_highlighting();
 	}
 
 	int len;
@@ -563,11 +806,42 @@ void draw_rows(struct append_buffer *ab)
 			int len = CONFIG.row[file_scroll_ver].rsize - CONFIG.scroll_hor;
 			if(len < 0) len =0;
 			if(len > CONFIG.screencols) len = CONFIG.screencols; /*Вот тут я обрезал строку(добавить потом режим переноса?)*/
-			ab_append(ab, &CONFIG.row[file_scroll_ver].render[CONFIG.scroll_hor], len);
+			char *c = &CONFIG.row[file_scroll_ver].render[CONFIG.scroll_hor];
+			unsigned char *hl = &CONFIG.row[file_scroll_ver].hl[CONFIG.scroll_hor];
+			int current_color = -1;
+			int j;
+			for (j = 0; j < len; ++j) {
+				if (iscntrl(c[j])) {
+					char sym = (c[j] <= 26) ? '@' + c[j] : '?';
+					ab_append(ab, "\x1b[7m", 4);
+					ab_append(ab, &sym, 1);
+					ab_append(ab, "\x1b[m", 3);
+					if (current_color != -1) {
+						char buf[16];
+						int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", current_color);
+						ab_append(ab, buf, clen);
+					}
+				} else if(hl[j] == HL_NORMAL) {
+					if (current_color != -1) {
+						ab_append(ab, "\x1b[39m", 5);
+						current_color = -1;	
+					}
+					ab_append(ab, &c[j], 1);
+				} else {
+					int color = syntax_to_color(hl[j]);
+					if (color != current_color){
+						current_color = color;
+						char buf[16];
+						int clen = snprintf(buf, sizeof(buf), "\x1b[%dm", color);
+						ab_append(ab, buf, clen);
+					}
+					ab_append(ab, &c[j], 1);
+				}
+			}
+			ab_append(ab,"\x1b[39m", 5);	
 		}
 		
 		ab_append(ab, "\x1b[K", 3);
-		
 		ab_append(ab, "\r\n", 2);		
 	}
 }
@@ -576,10 +850,11 @@ void draw_status_bar(struct append_buffer *ab)
 {
 	ab_append(ab, "\x1b[7m", 4);
 	char status[80], rstatus[80];
-	int len = snprintf(status, sizeof(status), "%.20s - %d lines", 
+	int len = snprintf(status, sizeof(status), "%.20s - %d lines %s", 
 		CONFIG.file_name ? CONFIG.file_name : "[No Name]", CONFIG.num_row,
 		CONFIG.dirty ? "(modified)" : "");
-	int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", CONFIG.cy + 1, CONFIG.num_row);
+	int rlen = snprintf(rstatus, sizeof(rstatus), "%s | %d/%d",
+		CONFIG.syntax ? CONFIG.syntax->filetype : "no ft", CONFIG.cy + 1, CONFIG.num_row);
 	if(len > CONFIG.screencols) len = CONFIG.screencols;
 	ab_append(ab, status, len);
 	while (len < CONFIG.screencols)
@@ -812,6 +1087,7 @@ void init()
 	CONFIG.file_name = NULL;
 	CONFIG.status_message[0] = '\0';
 	CONFIG.status_time = 0;
+	CONFIG.syntax = NULL;
 
 	if(get_window_size(&CONFIG.screenrows, &CONFIG.screencols) == -1)
 		die("get_window_size");
